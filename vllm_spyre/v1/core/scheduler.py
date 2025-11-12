@@ -341,6 +341,10 @@ class ContinuousBatchingSpyreScheduler(SpyreScheduler):
         Note: drawing explaining the algorithm in more detail uploaded here: 
         https://github.com/vllm-project/vllm-spyre/pull/363#issuecomment-3173605517
         """
+        # Optimization: Fast-path check - if batch is empty, always allow
+        if not running:
+            return True
+            
         # checking if cached result can be used
         outer_key = tuple(r.request_id
                           for r in running)  # decode batch changes

@@ -396,16 +396,19 @@ class SpyreModelRunner(BaseSpyreModelRunner[SamplingInputBatch,
             # if it exists
             self.input_batch.num_prompt_logprobs.pop(req_id, None)
 
+        # Optimization: Only refresh metadata when batch composition changes
+        needs_refresh = (scheduler_output.finished_req_ids or 
+                        len(scheduler_output.scheduled_new_reqs) > 0)
+        
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
                 self.requests.pop(req_id, None)
-                # TODO: Processing multiple removals at once can break alignment
-                # of logitprocs. Refactor so that we can batch removals to the
-                # `input_batch`
-                self.input_batch.refresh_metadata()
-        else:
-            # Due to logits processor we need to refresh metadata at each step
+        
+        if needs_refresh:
+            # TODO: Processing multiple removals at once can break alignment
+            # of logitprocs. Refactor so that we can batch removals to the
+            # `input_batch`
             self.input_batch.refresh_metadata()
 
     def _get_prompt_logprobs_dict(
@@ -1084,17 +1087,23 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         }
         req_ids = self.input_batch.sorted_requests_ids
 
+        # Optimization: Allocate blocks efficiently in one pass
         n_blocks = 0  # maximal number of blocks used by any seq in the batch
-        for req_id in req_ids:
-            # adding new blocks if needed
-            if self.tkv % self.block_size == 0:
+        needs_new_block = self.tkv % self.block_size == 0
+        
+        if needs_new_block:
+            for req_id in req_ids:
+                # adding new blocks if needed
                 self.req_ids2blocks[req_id].append(self.block_pool.popleft())
-            n_blocks = max(n_blocks, len(self.req_ids2blocks[req_id]))
+                n_blocks = max(n_blocks, len(self.req_ids2blocks[req_id]))
+        else:
+            # Just find max blocks without allocation
+            n_blocks = max(len(self.req_ids2blocks[req_id]) for req_id in req_ids)
 
+        # Optimization: Pre-allocate padding blocks list to avoid repeated appendleft
+        padding_blocks = [0] * n_blocks
+        
         for req_id in req_ids:
-            # TODO: Will this always just be one token ID if there's no spec
-            # or jump decoding?
-
             req_state: SamplingRequestState = self.requests[req_id]
 
             # filling block table with padding blocks to make it rectangular
@@ -1102,9 +1111,14 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             # be any allocated block id on the Sypre card (has to be in range
             # [0, self.n_blocks - 1]). Further, it also be a block id that holds
             # actual KV cache for another (or the same) sequence.
-            blocks = self.req_ids2blocks[req_id].copy()
-            for i in range(n_blocks - len(self.req_ids2blocks[req_id])):
-                blocks.appendleft(0)
+            req_blocks = self.req_ids2blocks[req_id]
+            num_padding = n_blocks - len(req_blocks)
+            
+            if num_padding > 0:
+                # Optimization: Use list slicing instead of copy() + appendleft loop
+                blocks = padding_blocks[:num_padding] + list(req_blocks)
+            else:
+                blocks = list(req_blocks)
             block_table.append(blocks)
 
             # slot_mapping for all blocks of sequence
@@ -1175,6 +1189,11 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         if len(self.requests) == 0:
             return
 
+        # Optimization: Quick check before expensive min() operation
+        # If no request has left padding, skip immediately
+        if all(r.left_padding == 0 for r in requests):
+            return
+
         min_left_pad = min([r.left_padding for r in requests])
         n_padded_blocks = min_left_pad // self.block_size
         offset = n_padded_blocks * self.block_size
@@ -1185,8 +1204,8 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             for req in requests:
                 req.left_padding -= offset
 
-        # update tkv
-        self.tkv -= offset
+            # update tkv
+            self.tkv -= offset
 
     def pad_input_ids(
         self,

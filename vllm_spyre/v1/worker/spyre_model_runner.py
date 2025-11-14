@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, Union, cast
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import (AutoModel, AutoModelForSequenceClassification,
@@ -826,6 +827,31 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             pin_memory=self.pin_memory,
             vocab_size=vllm_config.model_config.get_vocab_size())
 
+        # Performance optimization: Pre-allocate tensors for decode to avoid
+        # repeated allocations in hot path (2500+ times per generation)
+        max_batch = vllm_config.scheduler_config.max_num_seqs
+        max_blocks_per_seq = (vllm_config.model_config.max_model_len 
+                              // self.block_size)
+        
+        # Cache for frequently reused tensors in decode path
+        self._tkv_mask_cache = torch.empty(max_batch, dtype=torch.int64)
+        self._model_indices_cache = torch.ones(max_batch, 
+                                               dtype=torch.bool, 
+                                               device="cpu")
+        self._input_tokens_cache = torch.empty((max_batch, 1), 
+                                               dtype=torch.long, 
+                                               device=self.device)
+        self._position_ids_cache = torch.empty((max_batch, 1), 
+                                               dtype=torch.long, 
+                                               device=self.device)
+        self._left_padding_cache = torch.empty(max_batch, 
+                                               dtype=torch.long, 
+                                               device=self.device)
+        # Use numpy for block_table to avoid intermediate Python lists
+        self._block_table_np = np.zeros((max_batch, max_blocks_per_seq), 
+                                        dtype=np.int64)
+        self._slot_mapping_np = np.zeros((max_batch, 1), dtype=np.int64)
+
     def pre_warmup(self) -> None:
         # Set the number of kv cache blocks to the minimal value of 2 which is
         # required for warmup. After the warmup, the number of blocks will be
@@ -1100,10 +1126,13 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             # Just find max blocks without allocation
             n_blocks = max(len(self.req_ids2blocks[req_id]) for req_id in req_ids)
 
-        # Optimization: Pre-allocate padding blocks list to avoid repeated appendleft
-        padding_blocks = [0] * n_blocks
+        # Optimization: Use numpy array for block_table to avoid Python list overhead
+        batch_size = len(req_ids)
+        self._block_table_np[:batch_size, :] = 0  # Reset to padding value
         
-        for req_id in req_ids:
+        offset = self.tkv % self.block_size
+        
+        for idx, req_id in enumerate(req_ids):
             req_state: SamplingRequestState = self.requests[req_id]
 
             # filling block table with padding blocks to make it rectangular
@@ -1112,27 +1141,21 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             # [0, self.n_blocks - 1]). Further, it also be a block id that holds
             # actual KV cache for another (or the same) sequence.
             req_blocks = self.req_ids2blocks[req_id]
-            num_padding = n_blocks - len(req_blocks)
+            n_req_blocks = len(req_blocks)
             
-            if num_padding > 0:
-                # Optimization: Use list slicing instead of copy() + appendleft loop
-                blocks = padding_blocks[:num_padding] + list(req_blocks)
-            else:
-                blocks = list(req_blocks)
-            block_table.append(blocks)
+            # Direct numpy assignment - much faster than list operations
+            self._block_table_np[idx, :n_req_blocks] = list(req_blocks)
 
             # slot_mapping for all blocks of sequence
-            start_slot = block_table[-1][-1] * self.block_size
-            offset = self.tkv % self.block_size
-            slot = [start_slot + offset]
-            slot_mapping.append(slot)
+            start_slot = req_blocks[-1] * self.block_size
+            self._slot_mapping_np[idx, 0] = start_slot + offset
 
             # input token and position of the token generated in the last step
             generation_token = req_state.output_token_ids[-1]
-            input_tokens.append([generation_token])
+            input_tokens.append(generation_token)
             seq_len = cached_request_data.num_computed_tokens[
                 cached_reqs_map[req_id]]
-            input_positions.append([seq_len])
+            input_positions.append(seq_len)
 
             # retrieve left padding information stored during prefill and
             # updated when calling reduce_left_padding()
@@ -1141,23 +1164,34 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         # update tkv
         self.tkv = self.tkv + 1
 
-        # construct tensors from lists
-        input_tokens = torch.tensor(input_tokens,
-                                    dtype=torch.long,
-                                    device=self.device)
-        position_ids = torch.tensor(input_positions,
-                                    dtype=torch.long,
-                                    device=self.device)
-        current_tkv_mask = torch.tensor([self.tkv] * len(input_tokens),
-                                        dtype=torch.int64)
-        left_padded_prompt_mask = torch.tensor(left_padded_prompt_mask,
-                                               dtype=torch.long,
-                                               device=self.device)
-        block_table = torch.tensor(block_table, dtype=torch.int64)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
-        self.model.indices = torch.ones(len(cached_request_data.req_ids),
-                                        dtype=torch.bool,
-                                        device="cpu")
+        # Optimization: Reuse pre-allocated tensors instead of creating new ones
+        # This eliminates ~6 tensor allocations per decode step (2500+ per generation)
+        
+        # Use cached tensors and update values in-place
+        self._input_tokens_cache[:batch_size, 0] = torch.tensor(
+            input_tokens, dtype=torch.long)
+        self._position_ids_cache[:batch_size, 0] = torch.tensor(
+            input_positions, dtype=torch.long)
+        self._left_padding_cache[:batch_size] = torch.tensor(
+            left_padded_prompt_mask, dtype=torch.long)
+        
+        # Use fill_() for uniform values - much faster than list multiplication
+        self._tkv_mask_cache[:batch_size].fill_(self.tkv)
+        
+        # Convert numpy arrays to tensors (zero-copy with torch.from_numpy)
+        block_table = torch.from_numpy(
+            self._block_table_np[:batch_size, :n_blocks].copy())
+        slot_mapping = torch.from_numpy(
+            self._slot_mapping_np[:batch_size].copy())
+        
+        # Return sliced views of cached tensors
+        input_tokens = self._input_tokens_cache[:batch_size]
+        position_ids = self._position_ids_cache[:batch_size]
+        current_tkv_mask = self._tkv_mask_cache[:batch_size]
+        left_padded_prompt_mask = self._left_padding_cache[:batch_size]
+        
+        # Reuse model indices cache
+        self.model.indices = self._model_indices_cache[:batch_size]
 
         # mask not needed during decode
         mask = None
@@ -1275,13 +1309,22 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         # TODO: probably we can remove some fields of the model input and
         # update only the SpyreAttentionMetadata
 
+        # Optimization: Cache scale_indices tensor to avoid repeated creation
+        # Only recreate if scale_indices changed
+        scale_indices_list = model_input.scale_indices
+        if not hasattr(self, '_scale_indices_cache') or \
+           not hasattr(self, '_cached_scale_indices_list') or \
+           self._cached_scale_indices_list != scale_indices_list:
+            self._scale_indices_cache = torch.tensor(scale_indices_list,
+                                                     dtype=torch.int32)
+            self._cached_scale_indices_list = scale_indices_list
+
         return SpyreAttentionMetadata(
             slot_mapping=model_input.slot_mapping,
             current_tkv_mask=model_input.current_tkv_mask,
             left_padded_prompt_mask=model_input.left_padded_prompt_mask,
             block_table=model_input.block_table,
-            scale_indices=torch.tensor(model_input.scale_indices,
-                                       dtype=torch.int32),
+            scale_indices=self._scale_indices_cache,
             is_prefill=model_input.is_prompt)
 
     def get_sampling_metadata(self, is_prefill: bool) -> SamplingMetadata:

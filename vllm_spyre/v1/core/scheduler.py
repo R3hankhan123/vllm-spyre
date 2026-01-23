@@ -590,7 +590,7 @@ class ChunkedPrefillSpyreScheduler(ContinuousBatchingSpyreScheduler):
     def can_schedule_prefill(self, request: Request) -> bool:
         # running and waiting queues are both empty, we can start a new batch
         # which can always be scheduled
-        if len(self.running) + len(self.waiting) == 0:
+        if len(self.running) + len(self.waiting) + len(self.ongoing_prefills) == 0:
             return True
 
         if not self._has_scheduling_priority(request):

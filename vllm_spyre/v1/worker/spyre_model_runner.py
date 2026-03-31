@@ -1083,6 +1083,11 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             self.req_ids2num_reserved_blocks.pop(req_id, None)
             self.kv_cache_manager.free(req_id)
 
+        # BUGFIX: Reset TKV to 0 when decode batch becomes empty
+        # This prevents TKV from accumulating across batch iterations
+        if len(self.req_ids2num_reserved_blocks) == 0:
+            self.tkv = 0
+
     def _prepare_prompt(self, new_request_data: list[NewRequestData]) -> SamplingForwardInputs:
         # currently all prefills are of batch size 1
         assert len(new_request_data) == 1

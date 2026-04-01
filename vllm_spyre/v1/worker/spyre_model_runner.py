@@ -453,6 +453,10 @@ class SpyreModelRunner(
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
+                # CRITICAL: Remove from requests dict to prevent state pollution
+                if req_id in self.requests:
+                    del self.requests[req_id]
+                    logger.debug("Removed finished request %s from requests dict", req_id)
                 self.requests.pop(req_id, None)
                 # TODO: Processing multiple removals at once can break alignment
                 # of logitprocs. Refactor so that we can batch removals to the
@@ -1076,17 +1080,16 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         # TODO: move to kv cache manager
         # Continuous batching: free blocks
         for req_id in scheduler_output.finished_req_ids:
+            # CRITICAL: Remove from requests dict to prevent state pollution
+            if req_id in self.requests:
+                del self.requests[req_id]
+                logger.debug("Removed finished request %s from requests dict (CB)", req_id)
             if logger.isEnabledFor(DEBUG) and (blocks_to_free := self._get_blocks(req_id)):
                 logger.debug("Freeing request id: %s", req_id)
                 for block in blocks_to_free:
                     logger.debug("Freeing block with id: %s", block.block_id)
             self.req_ids2num_reserved_blocks.pop(req_id, None)
             self.kv_cache_manager.free(req_id)
-
-        # BUGFIX: Reset TKV to 0 when decode batch becomes empty
-        # This prevents TKV from accumulating across batch iterations
-        if len(self.req_ids2num_reserved_blocks) == 0:
-            self.tkv = 0
 
     def _prepare_prompt(self, new_request_data: list[NewRequestData]) -> SamplingForwardInputs:
         # currently all prefills are of batch size 1
@@ -1761,7 +1764,10 @@ class SpyrePoolingModelRunner(
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
-                self.requests.pop(req_id, None)
+                # CRITICAL: Remove from requests dict to prevent state pollution
+                if req_id in self.requests:
+                    del self.requests[req_id]
+                    logger.debug("Removed finished request %s from requests dict (pooling)", req_id)
 
     def _uncompress_token_types(self) -> list[list[int]]:
         pooling_metadata = self.input_batch.make_pooling_metadata()
@@ -2413,15 +2419,32 @@ class ChunkedPrefillModelRunner(ContinuousBatchingSpyreModelRunner):
         assert sampling_params is not None, "sampling_params are required for this model runner"
         assert prompt_token_ids is not None, "prompt token ids are required for this model runner"
 
-        is_new_batch = self.get_n_free_blocks() == self.n_blocks
+        # Check if this is a new batch by checking if input_batch is empty
+        # This is more reliable than checking free blocks, as blocks may not be
+        # freed immediately even after requests finish
+        is_new_batch = self.input_batch.num_reqs == 0
         prompt_len = len(prompt_token_ids)
         mm_features = getattr(request, "mm_features", None)
 
         self.prefill_batch.clear_requests()
 
         # set the new tkv to the prompt length if starting a new decode batch
+        # IMPORTANT: Reset TKV to prompt_len (not max) to prevent accumulation across batches
         if is_new_batch:
+            old_tkv = self.tkv
             self.tkv = prompt_len
+            logger.info(
+                "Starting new batch (input_batch empty), reset TKV from %d to %d",
+                old_tkv,
+                prompt_len,
+            )
+        else:
+            logger.debug(
+                "Adding to existing batch (%d reqs), TKV=%d, prompt_len=%d",
+                self.input_batch.num_reqs,
+                self.tkv,
+                prompt_len,
+            )
 
         scheduler_request = Request(
             request_id=req_id,

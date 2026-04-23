@@ -46,8 +46,6 @@ def test_structured_output_json_object(
         monkeypatch=monkeypatch,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        use_pc=True,
-        cached=True,
         structured_outputs_config=StructuredOutputsConfig(backend=structured_output_backend),
     )
 
@@ -89,8 +87,6 @@ def test_structured_output_json_schema(
         monkeypatch=monkeypatch,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        use_pc=True,
-        cached=True,
         structured_outputs_config=StructuredOutputsConfig(backend=structured_output_backend),
     )
 
@@ -146,8 +142,6 @@ def test_structured_output_regex(
         monkeypatch=monkeypatch,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        use_pc=True,
-        cached=True,
         structured_outputs_config=StructuredOutputsConfig(backend=structured_output_backend),
     )
 
@@ -194,8 +188,6 @@ def test_structured_output_mixed_batch(
         monkeypatch=monkeypatch,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        use_pc=True,
-        cached=True,
         structured_outputs_config=StructuredOutputsConfig(backend=structured_output_backend),
     )
 
@@ -254,8 +246,6 @@ def test_structured_output_choice(
         monkeypatch=monkeypatch,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        use_pc=True,
-        cached=True,
         structured_outputs_config=StructuredOutputsConfig(backend=structured_output_backend),
     )
 

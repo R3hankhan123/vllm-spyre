@@ -10,6 +10,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 
+import sendnn_inference.envs as envs_spyre
 from sendnn_inference.multimodal.mm_mappings import MMUtilsBase, MMWarmupInputs
 
 # Extend the adapter as part of the head dim fix; this is needed to
@@ -90,7 +91,15 @@ class LlavaNextMMUtils(MMUtilsBase):
                 if any(k not in mm_spec for k in mm_spec_keys):
                     raise KeyError(f"Llava Next requires kwargs: {mm_spec_keys}")
 
-                fms_kwargs["pixel_values"] = mm_spec["pixel_values"].data
+                pixel_values = mm_spec["pixel_values"].data
+
+                # Convert pixel_values to the specified multimodal dtype
+                mm_dtype_str = envs_spyre.SENDNN_INFERENCE_MM_DTYPE
+                target_dtype = getattr(torch, mm_dtype_str, torch.float16)
+                if pixel_values.dtype != target_dtype:
+                    pixel_values = pixel_values.to(dtype=target_dtype)
+
+                fms_kwargs["pixel_values"] = pixel_values
                 image_sizes = mm_spec["image_sizes"].data
 
                 # Careful about this; if it's 1D, we'll a tensor of shape

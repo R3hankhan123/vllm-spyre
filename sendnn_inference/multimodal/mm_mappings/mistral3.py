@@ -9,6 +9,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 
+import sendnn_inference.envs as envs_spyre
 from sendnn_inference.multimodal.mm_mappings import MMUtilsBase, MMWarmupInputs
 
 
@@ -72,6 +73,13 @@ class Mistral3MMUtils(MMUtilsBase):
                 # If squeezed during spec building, add it back
                 if pixel_values.ndim == 3:
                     pixel_values = pixel_values.unsqueeze(0)
+
+                # Convert pixel_values to the specified multimodal dtype
+                mm_dtype_str = envs_spyre.SENDNN_INFERENCE_MM_DTYPE
+                target_dtype = getattr(torch, mm_dtype_str, torch.float16)
+                if pixel_values.dtype != target_dtype:
+                    pixel_values = pixel_values.to(dtype=target_dtype)
+
                 fms_kwargs["pixel_values"] = pixel_values
 
                 if "image_sizes" in mm_spec:

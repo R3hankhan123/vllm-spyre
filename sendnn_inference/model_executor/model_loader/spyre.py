@@ -236,6 +236,8 @@ class SpyreCausalLM(nn.Module):
             # When running on Spyre cards for either non-quantized (bf16) models
             # or quantized (fp8) models, we cast any bf16 params down
             self._cast_bf16_to_f16()
+            # Cast multimodal components to specified dtype if present
+            self._cast_mm_components()
             options = {"sendnn.dynamic": True} if sendnn_dynamic else {}
 
             # Lazy import to avoid load torch_sendnn runtime before it is really
@@ -279,6 +281,30 @@ class SpyreCausalLM(nn.Module):
                     name,
                 )
                 param.data = param.data.to(dtype=torch.float16)
+
+    def _cast_mm_components(self):
+        """Cast multimodal components to the dtype specified by SENDNN_INFERENCE_MM_DTYPE.
+
+        Only affects vision_tower and multi_modal_projector parameters.
+        Defaults to float16 if not specified.
+        """
+        mm_dtype_str = envs_spyre.SENDNN_INFERENCE_MM_DTYPE
+        target_dtype = getattr(torch, mm_dtype_str, torch.float16)
+
+        for name, param in self.fms_model.named_parameters():
+            # Only process multimodal components
+            is_mm_component = "vision_tower" in name or "multi_modal_projector" in name
+            if not is_mm_component:
+                continue
+
+            if param.dtype != target_dtype:
+                logger.debug(
+                    "Casting multimodal param %s from %s to %s",
+                    name,
+                    param.dtype,
+                    target_dtype,
+                )
+                param.data = param.data.to(dtype=target_dtype)
 
     def _cast_to_f32(self):
         """Cast model parameters to f32."""

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
 
 import torch
+import torch.distributed as dist
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
@@ -1034,18 +1035,68 @@ class ChunkedPrefillModelRunner(
         # For multimodal requests, compute embeddings once for the full sequence
         # and cache them, then slice per chunk. This ensures image features are
         # correctly aligned across all chunks.
+        #
+        # When running with tensor parallelism, only rank 0 runs the vision
+        # encoder (the expensive part) and the result is broadcast to all other
+        # ranks. This avoids redundant computation on every worker.
         if mm_features and request.cached_mm_embeddings is None:
-            # First chunk: compute full multimodal embeddings
-            full_input_tokens = torch.tensor(
-                prompt_token_ids, dtype=torch.int64, device=self.device
-            ).unsqueeze(0)
+            world_size = self.parallel_config.world_size
 
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
-                mm_features=mm_features,
-                is_decode=False,
-            )
+
+            if world_size <= 1:
+                full_input_tokens = torch.tensor(
+                    prompt_token_ids, dtype=torch.int64, device=self.device
+                ).unsqueeze(0)
+
+                full_embeds = self.model.get_maybe_mm_embeddings(
+                    full_input_tokens,
+                    mm_features=mm_features,
+                    is_decode=False,
+                )
+
+            if world_size > 1:
+                if self.rank == 0:
+                    # Temporarily give rank 0 all available CPU threads
+                    # since other workers are idle at the broadcast barrier.
+                    prev_threads = torch.get_num_threads()
+                    torch.set_num_threads(prev_threads * world_size)
+                    logger.debug(
+                        "Adjusted threads %d -> %d for vision encoding on rank 0",
+                        prev_threads,
+                        prev_threads * world_size,
+                    )
+
+                    full_input_tokens = torch.tensor(
+                        prompt_token_ids, dtype=torch.int64, device=self.device
+                    ).unsqueeze(0)
+
+                    full_embeds = self.model.get_maybe_mm_embeddings(
+                        full_input_tokens,
+                        mm_features=mm_features,
+                        is_decode=False,
+                    )
+
+                    torch.set_num_threads(prev_threads)
+                # Broadcast shape so non-rank-0 workers can allocate the
+                # receive buffer.
+                mm_dtype = envs_spyre.SENDNN_INFERENCE_CPU_MM_DTYPE
+
+                if self.rank == 0:
+                    shape_tensor = torch.tensor(full_embeds.shape, dtype=torch.long, device="cpu")
+                else:
+                    shape_tensor = torch.zeros(3, dtype=torch.long, device="cpu")
+
+                dist.broadcast(shape_tensor, src=0)
+
+                if self.rank != 0:
+                    full_embeds = torch.zeros(
+                        tuple(shape_tensor.tolist()),
+                        dtype=mm_dtype,
+                        device=self.device,
+                    )
+
+                dist.broadcast(full_embeds, src=0)
 
             t_elapsed = time.time() - t0
 
